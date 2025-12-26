@@ -1,0 +1,6 @@
+*.c text working-tree-encoding=Windows-1251 eol=crlf
+*.h text working-tree-encoding=Windows-1251 eol=crlf
+*.cpp text working-tree-encoding=Windows-1251 eol=crlf
+
+# Отключить преобразование для самого .gitattributes
+.gitattributes -text
