@@ -71,16 +71,16 @@ public:
 
     // Основная функция поиска пути (многослойная трассировка Хейса)
     QList<GridPoint> findPath(const GridPoint& start, const GridPoint& end,
-                            GridCell*** grid, int boardWidth, int boardHeight, int totalLayers,
-                            int currentPadId = -1);
+                             GridCell*** grid, int boardWidth, int boardHeight, int totalLayers,
+                             int fromPadId, int toPadId);  // ДВА параметра вместо одного
 
     // Проверка возможности размещения трассы
     bool canPlaceTrace(int x, int y, int layer, GridCell*** grid,
-                      int boardWidth, int boardHeight, int currentPadId);
+                      int boardWidth, int boardHeight, int fromPadId, int toPadId);  // ДВА параметра
 
     // Получение стоимости перехода между ячейками
     int getTransitionCost(const GridPoint& from, const GridPoint& to,
-                         GridCell*** grid, int currentPadId);
+                         GridCell*** grid, int fromPadId, int toPadId);
 
     // Эвристическая функция (Манхэттенское расстояние с учетом слоев)
     int heuristic(const GridPoint& a, const GridPoint& b);
@@ -88,7 +88,7 @@ public:
     // Получение соседей для алгоритма Хейса
     QList<GridPoint> getNeighbors(const GridPoint& point, GridCell*** grid,
                                  int boardWidth, int boardHeight, int totalLayers,
-                                 int currentPadId);
+                                 int fromPadId, int toPadId);
 
 private:
     // Направления для поиска (4-связность в плоскости + переходы между слоями)
