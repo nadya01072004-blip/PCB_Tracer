@@ -13,6 +13,24 @@ PathFinder::PathFinder()
 {
 }
 
+// В файле trace.cpp добавьте этот метод:
+QList<GridPoint> PathFinder::findPathSingleLayer(const GridPoint& start, const GridPoint& end,
+                                                GridCell*** grid, int boardWidth, int boardHeight,
+                                                int totalLayers, int fromPadId, int toPadId)
+{
+    // Упрощенный поиск пути в пределах одного слоя
+    GridPoint adjustedStart = start;
+    GridPoint adjustedEnd = end;
+
+    // Убедимся, что обе точки на одном слое
+    if (start.layer != end.layer) {
+        adjustedEnd.layer = start.layer;
+    }
+
+    return findPath(adjustedStart, adjustedEnd, grid, boardWidth, boardHeight,
+                   totalLayers, fromPadId, toPadId);
+}
+
 QList<GridPoint> PathFinder::findPath(const GridPoint& start, const GridPoint& end,
                                      GridCell*** grid, int boardWidth, int boardHeight, int totalLayers,
                                      int fromPadId, int toPadId)

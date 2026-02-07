@@ -28,6 +28,7 @@
 #include <QMutexLocker>
 #include "trace.h"
 #include "helpdialog.h"
+#include "multi_trace.h"
 
 namespace Ui {
 class MainWindow;
@@ -55,7 +56,6 @@ struct TraceLineInfo {
     int layer;
 };
 
-// Класс для выполнения трассировки в отдельном потоке
 class CustomGraphicsScene : public QGraphicsScene
 {
     Q_OBJECT
@@ -66,9 +66,10 @@ signals:
     void cellClicked(int x, int y);
 
 protected:
-    void mousePressEvent(QGraphicsSceneMouseEvent *event);
+    void mousePressEvent(QGraphicsSceneMouseEvent *event) override;
 };
 
+class MultiThreadedRouter;
 
 class MainWindow : public QMainWindow
 {
@@ -78,99 +79,10 @@ public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow();
 
-    struct RoutingResult {
-        int connIndex;
-        QList<GridPoint> path;
-        bool success;
-        int fromPadId;
-        int toPadId;
-
-        RoutingResult() : connIndex(-1), success(false), fromPadId(-1), toPadId(-1) {}
-    };
-
-    struct SafeGridAccess {
-        GridCell*** grid = nullptr;
-        int boardWidth = 0;
-        int boardHeight = 0;
-        int layerCount = 0;
-        QMutex* mutex = nullptr;
-
-        // Функция для безопасного доступа к ячейке
-        GridCell& cell(int x, int y, int layer) {
-            Q_ASSERT(mutex);
-            QMutexLocker locker(mutex);
-            Q_ASSERT(x >= 0 && x < boardWidth);
-            Q_ASSERT(y >= 0 && y < boardHeight);
-            Q_ASSERT(layer >= 0 && layer < layerCount);
-            return grid[layer][y][x];
-        }
-
-        // Проверка возможности размещения трассы (inline определение)
-        bool canPlaceTrace(int x, int y, int layer, int fromPadId, int toPadId) {
-            QMutexLocker locker(mutex);
-            if (x < 0 || x >= boardWidth || y < 0 || y >= boardHeight || layer < 0 || layer >= layerCount) {
-                return false;
-            }
-
-            const GridCell& cell = grid[layer][y][x];
-
-            // Для площадок: разрешаем доступ только к площадкам этого соединения
-            if (cell.type == CELL_PAD) {
-                return (cell.padId == fromPadId || cell.padId == toPadId);
-            }
-
-            // Для препятствий
-            if (cell.type == CELL_OBSTACLE) {
-                return false;
-            }
-
-            // Для трасс и VIA: можно использовать, если они свободны или принадлежат нам
-            if (cell.type == CELL_TRACE || cell.type == CELL_VIA) {
-                return (cell.traceId == -1 || cell.traceId == fromPadId);
-            }
-
-            // Пустые ячейки всегда доступны
-            return true;
-        }
-
-        // Размещение трассы (inline определение)
-        void placeTrace(int x, int y, int layer, int traceId) {
-            QMutexLocker locker(mutex);
-            if (x < 0 || x >= boardWidth || y < 0 || y >= boardHeight || layer < 0 || layer >= layerCount) {
-                return;
-            }
-
-            GridCell& cell = grid[layer][y][x];
-            if (cell.type == CELL_EMPTY) {
-                cell.type = CELL_TRACE;
-                cell.traceId = traceId;
-                cell.color = Qt::white;
-            }
-        }
-
-        // Размещение виа (inline определение)
-        void placeVia(int x, int y) {
-            QMutexLocker locker(mutex);
-            if (x < 0 || x >= boardWidth || y < 0 || y >= boardHeight) {
-                return;
-            }
-
-            // Помечаем как VIA на всех слоях
-            for (int l = 0; l < layerCount; l++) {
-                GridCell& cell = grid[l][y][x];
-                if (cell.type == CELL_EMPTY) {
-                    cell.type = CELL_VIA;
-                    cell.color = Qt::white;
-                }
-            }
-        }
-    };
-
 private slots:
     void onHelpClicked();
     void onCellClicked(int x, int y);
     void showFailedConnections();
-    // Обработчики кнопок
     void restoreFailedConnectionLines();
     void onSetObstacle();
     void onSetPad();
@@ -182,10 +94,13 @@ private slots:
     void onLayerCountChanged(int count);
     void onBoardSizeChanged();
     void onAutoFill();
-    void onRoutingMethodChanged();  // Новый слот
+    void onRoutingMethodChanged();
 
-    void processRoutingResultsImproved(const QList<RoutingResult>& results,
-                                                  const QList<Connection>& connectionsToRoute);
+    // Слоты для многопоточной трассировки
+    void onMultiThreadRoutingProgress(int percent);
+    void onMultiThreadRoutingComplete();
+    void onMultiThreadRoutingError(const QString& message);
+
     // Режимы работы
     void setModeObstacle();
     void setModePad();
@@ -200,57 +115,17 @@ private:
     QButtonGroup *layerButtonGroup;
     PathFinder pathFinder;
     QList<TraceLineInfo> traceLinesInfo;
-    QElapsedTimer routeTimer;  // Добавляем здесь
-    void updateTraceLinesForCurrentLayer();
+    QElapsedTimer routeTimer;
 
-    // Измените эту строку: убрали const
-    RoutingResult routeSingleConnectionAsync(int connIndex, const Connection& conn);
+    bool multiThreadRoutingInProgress = false;
 
-    bool canPlacePathInTempGrid(const QList<GridPoint>& path,
-                                   GridCell*** tempGrid,
-                                   int fromPadId, int toPadId);
-        void placePathInTempGrid(const QList<GridPoint>& path,
-                                GridCell*** tempGrid,
-                                int traceId);
-        void copyTempGridToMain(GridCell*** tempGrid);
-    int findLayerForPad(int x, int y);
-    void placeTraceSafely(const QList<GridPoint>& path, int fromPadId, int toPadId);
-    // Многопоточная трассировка
-    QList<RoutingResult> routeConnectionsParallel(const QList<Connection>& connectionsToRoute);
-    void processRoutingResults(const QList<RoutingResult>& results);
-    void routeSingleConnection(Connection& conn);  // Добавьте эту строку
-    // Для многопоточной оптимизации
-    GridCell*** createTempGrid();
-    void freeTempGrid(GridCell*** tempGrid);
-    int findOptimalLayer(int x, int y);
+    void showRoutingResults(int successCount, int totalCount, int failedCount,
+                               const QMap<int, int>& tracesPerLayer);
 
-    // Для безопасного доступа к сетке в многопоточном режиме
-    struct {
-        GridCell*** grid = nullptr;
-        int boardWidth = 0;
-        int boardHeight = 0;
-        int layerCount = 0;
-        QMutex* mutex = nullptr;
-
-        // Функция для безопасного доступа к ячейке
-        GridCell& cell(int x, int y, int layer) {
-            Q_ASSERT(mutex);
-            QMutexLocker locker(mutex);
-            Q_ASSERT(x >= 0 && x < boardWidth);
-            Q_ASSERT(y >= 0 && y < boardHeight);
-            Q_ASSERT(layer >= 0 && layer < layerCount);
-            return grid[layer][y][x];
-        }
-
-        // Проверка возможности размещения трассы
-        bool canPlaceTrace(int x, int y, int layer, int fromPadId, int toPadId);
-
-        // Размещение трассы
-        void placeTrace(int x, int y, int layer, int traceId);
-
-        // Размещение виа
-        void placeVia(int x, int y);
-    } safeGrid;
+    // Многопоточные компоненты
+    QThreadPool threadPool;
+    QList<QFutureWatcher<QList<GridPoint>>*> futureWatchers;
+    MultiThreadedRouter* multiThreadRouter;
 
     // Параметры платы
     int gridSize = 30;
@@ -270,16 +145,25 @@ private:
 
     // Для многопоточной трассировки
     QMutex gridMutex;
-    QThreadPool threadPool;
-    QList<QFutureWatcher<QList<GridPoint>>*> futureWatchers;
+
+    // Для безопасного доступа к сетке
+    struct SafeGridAccess {
+        GridCell*** grid;
+        int boardWidth;
+        int boardHeight;
+        int layerCount;
+        QMutex* mutex;
+    } safeGrid;
 
     // Данные
     QList<Pad> pads;
     QList<Connection> connections;
-    GridCell*** grid;
 
-    // Визуализация
+    // Сетка и визуализация
+    GridCell*** grid;
     QGraphicsRectItem*** cells;
+
+    // Идентификаторы
     int nextPadId = 1;
     int selectedPadId = -1;
 
@@ -295,7 +179,7 @@ private:
         QColor(128, 0, 128)
     };
 
-    // Инициализация
+    // Инициализация и отрисовка
     void initGrid();
     void clearGrid();
     void drawGrid();
@@ -303,8 +187,24 @@ private:
     void drawTraceLine(const GridPoint& from, const GridPoint& to, int layer);
     void drawConnectionLine(int padId1, int padId2);
     void updateConnectionLines();
+    void updateTraceLinesForCurrentLayer();
 
-    // Методы для работы с трассировкой
+    // Создание элементов UI для слоев
+    void createLayerRadioButtons();
+
+    // Авто-заполнение
+    void autoFillBoard();
+    QList<GridPoint> generateObstacle(int size, int type);
+
+    // Вспомогательные методы для работы с данными
+    Pad* getPadById(int id);
+    int getPadAt(int x, int y);
+    bool hasPadAt(int x, int y);
+    void updatePadConnections();
+    QColor getLayerColor(int layer, bool isActiveLayer);
+    void removeConnectionLines();
+
+    // Методы для работы с трассировкой (однопоточная)
     QList<GridPoint> findPath(const GridPoint& start, const GridPoint& end, int fromPadId, int toPadId);
     void placeVia(int x, int y);
     bool canPlaceTrace(int x, int y, int layer, int fromPadId, int toPadId);
@@ -313,37 +213,45 @@ private:
     void performSingleThreadedRouting();
     void performMultiThreadedRouting();
 
-    int countLayerTransitions(const QList<GridPoint>& path);
-        int estimateConnectionComplexity(int x1, int y1, int x2, int y2);
-        bool tryPlacePathWithRetry(const QList<GridPoint>& originalPath,
-                                  int fromPadId, int toPadId,
-                                  Connection& conn);
-        QList<GridPoint> adjustPathAroundConflict(const QList<GridPoint>& originalPath,
-                                                 int conflictIndex,
-                                                 int fromPadId, int toPadId);
-    void processMultiThreadedResults(const QList<RoutingResult>& results,
-                                       const QList<Connection>& connectionsToRoute);
-   void drawTraceLineMultiThreaded(const GridPoint& from, const GridPoint& to, int layer);
-    QList<GridPoint>routeConnection(Pad* fromPad, Pad* toPad);
+    // Методы многопоточной обработки
+    void processMultiThreadedResults(const QList<RoutingResult>& results, const QList<Connection>& connectionsToRoute);
     void processRoutedPath(const QList<GridPoint>& path, Connection& conn, Pad* fromPad);
+    QList<GridPoint> routeConnection(Pad* fromPad, Pad* toPad);
+    void drawTraceLineMultiThreaded(const GridPoint& from, const GridPoint& to, int layer);
+    int findLayerForPad(int x, int y);
+    void placeTraceSafely(const QList<GridPoint>& path, int fromPadId, int toPadId);
+    void processRoutingResultsImproved(const QList<RoutingResult>& results, const QList<Connection>& connectionsToRoute);
+    QList<RoutingResult> routeConnectionsParallel(const QList<Connection>& connectionsToRoute);
+    void processRoutingResults(const QList<RoutingResult>& results);
+    void routeSingleConnection(Connection& conn);
 
-    void updateCellDisplayWithLayerHighlight(int x, int y, int layer = -1);
-    QColor getLayerColor(int layer, bool isActiveLayer);
-    void removeConnectionLines();
+    // Вспомогательные методы для многопоточной трассировки
+    int countLayerTransitions(const QList<GridPoint>& path);
+    int estimateConnectionComplexity(int x1, int y1, int x2, int y2);
+    QList<GridPoint> adjustPathAroundConflict(const QList<GridPoint>& originalPath,
+                                             int conflictIndex,
+                                             int fromPadId, int toPadId);
+    RoutingResult routeSingleConnectionAsync(int connIndex, const Connection& conn);
+    bool canPlacePathInTempGrid(const QList<GridPoint>& path,
+                               GridCell*** tempGrid,
+                               int fromPadId, int toPadId);
+    void placePathInTempGrid(const QList<GridPoint>& path,
+                            GridCell*** tempGrid,
+                            int traceId);
+    void copyTempGridToMain(GridCell*** tempGrid);
 
-    // Вспомогательные методы
-    Pad* getPadById(int id);
-    int getPadAt(int x, int y);
-    bool hasPadAt(int x, int y);
-    void updatePadConnections();
+    // Вспомогательные методы для временной сетки
+    GridCell*** createTempGrid();
+    void freeTempGrid(GridCell*** tempGrid);
 
-    // Авто-заполнение
-    void autoFillBoard();
-    QList<GridPoint> generateObstacle(int size, int type);
+    // Методы для подготовки данных для многопоточной трассировки
+    QList<ConnectionRequest> prepareConnectionRequests();
+    void applyRoutingResults(const QList<RoutingResult>& results);
 
-    // Создание элементов UI для слоев
-    void createLayerRadioButtons();
+    // Метод выбора оптимального слоя
+    int findOptimalLayer(int x, int y);
 };
+
 
 class BoardSizeDialog : public QDialog
 {

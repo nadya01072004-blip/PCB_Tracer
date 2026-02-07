@@ -84,6 +84,10 @@ class PathFinder
 public:
     PathFinder();
 
+    QList<GridPoint> findPathSingleLayer(const GridPoint& start, const GridPoint& end,
+                                        GridCell*** grid, int boardWidth, int boardHeight,
+                                        int totalLayers, int fromPadId, int toPadId);
+
     // Основная функция поиска пути (многослойная трассировка Хейса)
     QList<GridPoint> findPath(const GridPoint& start, const GridPoint& end,
                              GridCell*** grid, int boardWidth, int boardHeight, int totalLayers,

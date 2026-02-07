@@ -24,6 +24,7 @@
 #include <QtConcurrent/QtConcurrent>
 #include <QFutureWatcher>
 #include <QFutureSynchronizer>
+#include <QTextBrowser>
 #include "routingtask.h"
 
 void CustomGraphicsScene::mousePressEvent(QGraphicsSceneMouseEvent *event)
@@ -37,13 +38,15 @@ void CustomGraphicsScene::mousePressEvent(QGraphicsSceneMouseEvent *event)
 
 MainWindow::MainWindow(QWidget *parent) :
     QMainWindow(parent),
-    ui(new Ui::MainWindow),
-    scene(nullptr),
-    layerButtonGroup(new QButtonGroup(this)),
-    grid(nullptr),
-    cells(nullptr)
+        ui(new Ui::MainWindow),
+        scene(nullptr),
+        layerButtonGroup(new QButtonGroup(this)),
+        grid(nullptr),
+        cells(nullptr)
 {
     ui->setupUi(this);
+
+    threadPool.setMaxThreadCount(QThread::idealThreadCount());
 
     currentRoutingMethod = SINGLE_THREADED; // По умолчанию однопоточный
         ui->singleThreadRadio->setChecked(true);
@@ -102,9 +105,6 @@ MainWindow::MainWindow(QWidget *parent) :
             this, &MainWindow::onLayerCountChanged);
     connect(ui->autoFillBtn, &QPushButton::clicked, this, &MainWindow::onAutoFill);
 
-    connect(ui->singleThreadRadio, &QRadioButton::toggled, this, &MainWindow::onRoutingMethodChanged);
-    connect(ui->multiThreadRadio, &QRadioButton::toggled, this, &MainWindow::onRoutingMethodChanged);
-
     // Инициализация сетки - теперь scene уже создана
     initGrid();
     drawGrid();
@@ -139,6 +139,62 @@ MainWindow::~MainWindow()
     clearGrid();
 
     delete ui;
+}
+
+// Добавьте реализацию недостающих методов:
+void MainWindow::drawTraceLineMultiThreaded(const GridPoint& from, const GridPoint& to, int layer) {
+    // Просто вызываем обычный метод
+    drawTraceLine(from, to, layer);
+}
+
+int MainWindow::findLayerForPad(int x, int y) {
+    for (int l = 0; l < layerCount; l++) {
+        if (grid[l][y][x].type == CELL_PAD) {
+            return l;
+        }
+    }
+    return 0;
+}
+
+void MainWindow::placeTraceSafely(const QList<GridPoint>& path, int fromPadId, int toPadId) {
+    QMutexLocker locker(&gridMutex);
+
+    for (int i = 0; i < path.size(); i++) {
+        const GridPoint& point = path[i];
+
+        if (point.x < 0 || point.x >= boardWidth ||
+            point.y < 0 || point.y >= boardHeight ||
+            point.layer < 0 || point.layer >= layerCount) {
+            continue;
+        }
+
+        GridCell& cell = grid[point.layer][point.y][point.x];
+
+        if (cell.type == CELL_PAD) continue;
+
+        bool isVia = false;
+        if (i > 0) {
+            const GridPoint& prev = path[i - 1];
+            if (prev.x == point.x && prev.y == point.y && prev.layer != point.layer) {
+                isVia = true;
+            }
+        }
+
+        if (isVia) {
+            cell.type = CELL_VIA;
+        } else {
+            cell.type = CELL_TRACE;
+        }
+        cell.traceId = fromPadId;
+    }
+
+    for (Connection& conn : connections) {
+        if (conn.fromPadId == fromPadId && conn.toPadId == toPadId) {
+            conn.routed = true;
+            conn.layer = path.first().layer;
+            break;
+        }
+    }
 }
 
 void MainWindow::processMultiThreadedResults(const QList<RoutingResult>& results,
@@ -1103,6 +1159,12 @@ void MainWindow::onRoute()
         return;
     }
 
+    // Проверяем, не выполняется ли уже трассировка
+    if (multiThreadRoutingInProgress) {
+        QMessageBox::warning(this, "Внимание", "Трассировка уже выполняется");
+        return;
+    }
+
     // Очищаем старые трассы
     onClearTraces();
 
@@ -1118,38 +1180,6 @@ void MainWindow::onRoute()
         performMultiThreadedRouting();
         break;
     }
-
-    // Останавливаем замер времени
-    qint64 elapsedMs = routeTimer.elapsed();
-
-    // Восстанавливаем стандартное отображение для неудачных связей
-    restoreFailedConnectionLines();
-
-    // Обновляем отображение
-    drawGrid();
-
-    // Подсчитываем фактическое количество успешных трасс
-    int successfulTraces = 0;
-    for (const Connection& conn : connections) {
-        if (conn.routed) {
-            successfulTraces++;
-        }
-    }
-
-    // Показываем время трассировки
-    QString methodName = (currentRoutingMethod == SINGLE_THREADED) ? "однопоточный" : "многопоточный";
-    QString timeMessage = QString("Трассировка (%1) завершена за %2 мс").arg(methodName).arg(elapsedMs);
-    ui->statusBar->showMessage(timeMessage);
-
-    // Показываем диалог с реальными результатами
-    QMessageBox::information(this, "Время трассировки",
-        QString("Метод: %1\n"
-               "Время: %2 мс\n"
-               "Успешно проложено: %3 из %4 трасс")
-        .arg(methodName)
-        .arg(elapsedMs)
-        .arg(successfulTraces)  // Используем подсчитанное значение
-        .arg(connections.size()));
 }
 
 void MainWindow::performSingleThreadedRouting()
@@ -1364,376 +1394,316 @@ void MainWindow::performSingleThreadedRouting()
         QApplication::processEvents();
     }
 
-    // В конце трассировки восстанавливаем отображение неудачных связей
-    // (они уже должны быть черными пунктирами)
+    // В самом конце метода добавьте:
+       qDebug() << "=== ТРАССИРОВКА ЗАВЕРШЕНА ===";
+       qDebug() << "Успешно проложено:" << routedCount << "из" << connections.size();
+       qDebug() << "Неудачные соединения:" << failedConnections.size();
 
-    qDebug() << "=== ТРАССИРОВКА ЗАВЕРШЕНА ===";
-    qDebug() << "Успешно проложено:" << routedCount << "из" << connections.size();
-    qDebug() << "Неудачные соединения:" << failedConnections.size();
+       // Выводим статистику по слоям
+       QMap<int, int> tracesPerLayer;
+       for (int l = 0; l < layerCount; l++) {
+           int traceCount = 0;
+           for (int y = 0; y < boardHeight; y++) {
+               for (int x = 0; x < boardWidth; x++) {
+                   if (grid[l][y][x].type == CELL_TRACE || grid[l][y][x].type == CELL_VIA) {
+                       traceCount++;
+                   }
+               }
+           }
+           tracesPerLayer[l] = traceCount;
+       }
 
-    // Выводим статистику по слоям
-    QMap<int, int> tracesPerLayer;
-    for (int l = 0; l < layerCount; l++) {
-        int traceCount = 0;
-        for (int y = 0; y < boardHeight; y++) {
-            for (int x = 0; x < boardWidth; x++) {
-                if (grid[l][y][x].type == CELL_TRACE || grid[l][y][x].type == CELL_VIA) {
-                    traceCount++;
-                }
-            }
-        }
-        tracesPerLayer[l] = traceCount;
-    }
+       qDebug() << "Распределение трасс по слоям:";
+       for (int l = 0; l < layerCount; l++) {
+           qDebug() << "  Слой" << l << ":" << tracesPerLayer[l] << "трасс";
+       }
 
-    qDebug() << "Распределение трасс по слоям:";
-    for (int l = 0; l < layerCount; l++) {
-        qDebug() << "  Слой" << l << ":" << tracesPerLayer[l] << "трасс";
-    }
-}
+       // ПОКАЗЫВАЕМ ОКНО С РЕЗУЛЬТАТАМИ
+       showRoutingResults(routedCount, connections.size(), failedConnections.size(), tracesPerLayer);
+   }
 
 void MainWindow::performMultiThreadedRouting()
 {
-    failedConnections.clear();
+    if (connections.isEmpty()) {
+        QMessageBox::information(this, "Информация", "Нет связей для трассировки");
+        return;
+    }
 
-        qDebug() << "=== ОПТИМИЗИРОВАННАЯ МНОГОПОТОЧНАЯ ТРАССИРОВКА ===";
-        qDebug() << "Количество соединений:" << connections.size();
+    // Очищаем старые трассы
+    onClearTraces();
 
-        // Шаг 1: Группируем соединения для параллельной обработки
-        QVector<QPair<int, int>> connectionPairs;
-        for (const Connection& conn : connections) {
-            connectionPairs.append(qMakePair(conn.fromPadId, conn.toPadId));
-        }
+    // Подготавливаем данные для трассировки
+    QList<ConnectionRequest> requests = prepareConnectionRequests();
 
-        // Шаг 2: Параллельный поиск ВСЕХ путей
-        QList<RoutingResult> allResults;
-        QMutex resultsMutex;
+    if (requests.isEmpty()) {
+        QMessageBox::information(this, "Информация", "Нет соединений для трассировки");
+        return;
+    }
 
-        // Используем QtConcurrent для параллельного поиска
-        QtConcurrent::blockingMap(connectionPairs, [&](const QPair<int, int>& pair) {
-            Pad* fromPad = getPadById(pair.first);
-            Pad* toPad = getPadById(pair.second);
+    qDebug() << "Запуск многопоточной трассировки для" << requests.size() << "соединений";
 
-            if (!fromPad || !toPad) return;
+    // Создаем и настраиваем роутер
+    multiThreadRouter = new MultiThreadedRouter(
+        grid, boardWidth, boardHeight, layerCount,
+        requests,
+        this
+    );
 
-            // Ищем оптимальные слои для старта и конца
-            int startLayer = findOptimalLayer(fromPad->x, fromPad->y);
-            int endLayer = findOptimalLayer(toPad->x, toPad->y);
+    // Настраиваем количество потоков
+    multiThreadRouter->setLayerThreadCount(2); // 2 потока на слой
 
-            // Проверяем, что на выбранных слоях есть площадки
-            bool startOk = false, endOk = false;
-            for (int l = 0; l < layerCount; l++) {
-                if (grid[l][fromPad->y][fromPad->x].type == CELL_PAD && !startOk) {
-                    startLayer = l;
-                    startOk = true;
-                }
-                if (grid[l][toPad->y][toPad->x].type == CELL_PAD && !endOk) {
-                    endLayer = l;
-                    endOk = true;
-                }
-            }
+    // Подключаем сигналы с использованием старого синтаксиса для надежности
+    connect(multiThreadRouter, SIGNAL(progressChanged(int)),
+            this, SLOT(onMultiThreadRoutingProgress(int)));
+    connect(multiThreadRouter, SIGNAL(routingComplete()),
+            this, SLOT(onMultiThreadRoutingComplete()));
+    connect(multiThreadRouter, SIGNAL(errorOccurred(QString)),
+            this, SLOT(onMultiThreadRoutingError(QString)));
 
-            if (!startOk || !endOk) return;
+    // Устанавливаем флаг
+    multiThreadRoutingInProgress = true;
+    ui->routeBtn->setEnabled(false);
 
-            GridPoint start(fromPad->x, fromPad->y, startLayer);
-            GridPoint end(toPad->x, toPad->y, endLayer);
+    // Запускаем таймер и трассировку
+    routeTimer.start();
+    multiThreadRouter->startRouting();
 
-            // Блокируем сетку только на время поиска пути
-            QList<GridPoint> path;
-            {
-                QMutexLocker locker(&gridMutex);
-                path = pathFinder.findPath(start, end, grid,
-                                          boardWidth, boardHeight,
-                                          layerCount, fromPad->id, toPad->id);
-            }
+    ui->statusBar->showMessage("Многопоточная трассировка запущена...");
+}
 
-            if (!path.isEmpty()) {
-                RoutingResult result;
-                result.fromPadId = fromPad->id;
-                result.toPadId = toPad->id;
-                result.path = path;
-                result.success = true;
+void MainWindow::onMultiThreadRoutingProgress(int percent) {
+    ui->statusBar->showMessage(QString("Трассировка: %1% завершено").arg(percent));
+}
 
-                QMutexLocker locker(&resultsMutex);
-                allResults.append(result);
-            }
-        });
+void MainWindow::onMultiThreadRoutingError(const QString& message) {
+    QMessageBox::warning(this, "Ошибка многопоточной трассировки", message);
 
-        // Шаг 3: Оптимизированное размещение трасс
-        qDebug() << "Найдено возможных путей:" << allResults.size();
+    if (multiThreadRouter) {
+        delete multiThreadRouter;
+        multiThreadRouter = nullptr;
+    }
+}
 
-        // Сортируем пути по качеству (длина + количество переходов)
-        std::sort(allResults.begin(), allResults.end(),
-                  [](const RoutingResult& a, const RoutingResult& b) {
-                      if (a.path.size() != b.path.size()) {
-                          return a.path.size() < b.path.size();
-                      }
+void MainWindow::onMultiThreadRoutingComplete()
+{
+    qint64 elapsedMs = routeTimer.elapsed();
 
-                      // Считаем переходы между слоями
-                      int aTransitions = 0, bTransitions = 0;
-                      if (!a.path.isEmpty()) {
-                          int currentLayer = a.path[0].layer;
-                          for (int i = 1; i < a.path.size(); i++) {
-                              if (a.path[i].layer != currentLayer) {
-                                  aTransitions++;
-                                  currentLayer = a.path[i].layer;
-                              }
-                          }
-                      }
-                      if (!b.path.isEmpty()) {
-                          int currentLayer = b.path[0].layer;
-                          for (int i = 1; i < b.path.size(); i++) {
-                              if (b.path[i].layer != currentLayer) {
-                                  bTransitions++;
-                                  currentLayer = b.path[i].layer;
-                              }
-                          }
-                      }
+    if (!multiThreadRouter) return;
 
-                      return aTransitions < bTransitions;
-                  });
+    // Получаем результаты
+    QList<RoutingResult> results = multiThreadRouter->getSuccessfulResults();
+    QList<QPair<int, int>> failed = multiThreadRouter->getFailedConnections();
 
-        // Шаг 4: Параллельное размещение трасс с оптимистичной блокировкой
-        QAtomicInt routedCount(0);
+    // Применяем результаты
+    int successfulTraces = 0;
 
-        #pragma omp parallel for if(allResults.size() > 10)
-        for (int i = 0; i < allResults.size(); i++) {
-            const RoutingResult& result = allResults[i];
-            if (!result.success) continue;
+    QMutexLocker locker(&gridMutex);
 
+    for (const RoutingResult& result : results) {
+        if (result.success && !result.path.isEmpty()) {
             // Находим соответствующее соединение
-            Connection* conn = nullptr;
-            for (Connection& c : connections) {
-                if (c.fromPadId == result.fromPadId && c.toPadId == result.toPadId) {
-                    conn = &c;
-                    break;
-                }
-            }
+            for (Connection& conn : connections) {
+                if (conn.fromPadId == result.fromPadId &&
+                    conn.toPadId == result.toPadId && !conn.routed) {
 
-            if (!conn || conn->routed) continue;
-
-            Pad* fromPad = getPadById(result.fromPadId);
-            Pad* toPad = getPadById(result.toPadId);
-            if (!fromPad || !toPad) continue;
-
-            // Пытаемся разместить трассу с оптимистичной блокировкой
-            bool placed = false;
-
-            // Создаем временную копию пути для размещения
-            QList<GridPoint> pathToPlace = result.path;
-
-            // Проверяем и размещаем с блокировкой
-            {
-                QMutexLocker locker(&gridMutex);
-
-                // Проверяем возможность размещения
-                bool canPlace = true;
-                for (int j = 0; j < pathToPlace.size(); j++) {
-                    const GridPoint& point = pathToPlace[j];
-
-                    // Пропускаем площадки
-                    if ((point.x == fromPad->x && point.y == fromPad->y) ||
-                        (point.x == toPad->x && point.y == toPad->y)) {
-                        continue;
-                    }
-
-                    if (point.x < 0 || point.x >= boardWidth ||
-                        point.y < 0 || point.y >= boardHeight ||
-                        point.layer < 0 || point.layer >= layerCount) {
-                        canPlace = false;
-                        break;
-                    }
-
-                    GridCell& cell = grid[point.layer][point.y][point.x];
-
-                    // Разрешаем использование:
-                    // 1. Пустых ячеек
-                    // 2. Своих трасс (traceId == fromPadId)
-                    // 3. Ячеек с traceId = -1 (свободные)
-                    if (cell.type == CELL_OBSTACLE) {
-                        canPlace = false;
-                        break;
-                    }
-
-                    if ((cell.type == CELL_TRACE || cell.type == CELL_VIA) &&
-                        cell.traceId != -1 && cell.traceId != fromPad->id) {
-                        canPlace = false;
-                        break;
-                    }
-                }
-
-                if (canPlace) {
-                    // Размещаем трассу
-                    for (int j = 0; j < pathToPlace.size(); j++) {
-                        const GridPoint& point = pathToPlace[j];
-
-                        // Пропускаем площадки
-                        if ((point.x == fromPad->x && point.y == fromPad->y) ||
-                            (point.x == toPad->x && point.y == toPad->y)) {
-                            continue;
+                    // Проверяем возможность размещения
+                    bool canPlace = true;
+                    for (const GridPoint& point : result.path) {
+                        if (point.x < 0 || point.x >= boardWidth ||
+                            point.y < 0 || point.y >= boardHeight ||
+                            point.layer < 0 || point.layer >= layerCount) {
+                            canPlace = false;
+                            break;
                         }
 
                         GridCell& cell = grid[point.layer][point.y][point.x];
+                        Pad* fromPad = getPadById(result.fromPadId);
 
-                        // Определяем VIA (переход между слоями в той же точке)
-                        bool isVia = false;
-                        if (j > 0) {
-                            const GridPoint& prev = pathToPlace[j - 1];
-                            if (prev.x == point.x && prev.y == point.y &&
-                                prev.layer != point.layer) {
-                                isVia = true;
+                        // Пропускаем начальную и конечную точки
+                        if (fromPad &&
+                           ((point.x == fromPad->x && point.y == fromPad->y) ||
+                            (point.x == result.path.last().x && point.y == result.path.last().y))) {
+                            continue;
+                        }
+
+                        if (cell.type == CELL_OBSTACLE ||
+                           (cell.type == CELL_TRACE && cell.traceId != result.fromPadId) ||
+                           (cell.type == CELL_VIA && cell.traceId != result.fromPadId)) {
+                            canPlace = false;
+                            break;
+                        }
+                    }
+
+                    if (canPlace) {
+                        // Размещаем трассу
+                        for (int i = 0; i < result.path.size(); i++) {
+                            const GridPoint& point = result.path[i];
+                            GridCell& cell = grid[point.layer][point.y][point.x];
+
+                            // Пропускаем площадки
+                            if (cell.type == CELL_PAD) continue;
+
+                            // Определяем, является ли это VIA
+                            bool isVia = false;
+                            if (i > 0) {
+                                const GridPoint& prev = result.path[i - 1];
+                                if (prev.x == point.x && prev.y == point.y &&
+                                    prev.layer != point.layer) {
+                                    isVia = true;
+                                }
                             }
+
+                            if (isVia) {
+                                cell.type = CELL_VIA;
+                            } else {
+                                cell.type = CELL_TRACE;
+                            }
+                            cell.traceId = result.fromPadId;
                         }
 
-                        if (isVia) {
-                            cell.type = CELL_VIA;
-                            cell.color = Qt::black;
-                        } else {
-                            cell.type = CELL_TRACE;
-                            cell.color = Qt::white;
+                        // Обновляем соединение
+                        conn.routed = true;
+                        conn.layer = result.path.first().layer;
+
+                        // Скрываем линию связи
+                        if (conn.visualLine) {
+                            conn.visualLine->hide();
                         }
-                        cell.traceId = fromPad->id;
+
+                        // Рисуем линии трасс
+                        for (int i = 0; i < result.path.size() - 1; i++) {
+                            drawTraceLine(result.path[i], result.path[i + 1], result.path[i].layer);
+                        }
+
+                        successfulTraces++;
+                        break;
                     }
-
-                    // Обновляем соединение
-                    conn->routed = true;
-                    conn->layer = pathToPlace.first().layer;
-                    placed = true;
-                    routedCount++;
-
-                    // Уведомляем GUI о новой трассе (выполняем в основном потоке)
-                    QMetaObject::invokeMethod(this, [this, pathToPlace, fromPad]() {
-                        for (int k = 0; k < pathToPlace.size() - 1; k++) {
-                            drawTraceLine(pathToPlace[k], pathToPlace[k + 1], pathToPlace[k].layer);
-                        }
-                    }, Qt::QueuedConnection);
-                }
-            }
-
-            if (!placed) {
-                #pragma omp critical
-                {
-                    failedConnections.append(fromPad->id);
                 }
             }
         }
-
-        qDebug() << "Успешно размещено трасс:" << routedCount;
-        qDebug() << "Неудачные соединения:" << failedConnections.size();
     }
 
-bool MainWindow::tryPlacePathWithRetry(const QList<GridPoint>& originalPath,
-                                      int fromPadId, int toPadId,
-                                      Connection& conn)
+    // Обновляем отображение
+    drawGrid();
+
+    // Восстанавливаем линии для неудачных соединений
+    restoreFailedConnectionLines();
+
+    // Показываем результаты
+    QString message = QString("Многопоточная трассировка завершена за %1 мс\n")
+                     .arg(elapsedMs);
+    message += QString("Успешно: %1, Неудачно: %2")
+               .arg(successfulTraces).arg(failed.size());
+
+    ui->statusBar->showMessage(message);
+
+    QMessageBox::information(this, "Трассировка завершена", message);
+
+    multiThreadRoutingInProgress = false;
+    ui->routeBtn->setEnabled(true);
+
+    // Очищаем роутер
+    delete multiThreadRouter;
+    multiThreadRouter = nullptr;
+
+    QMap<int, int> tracesPerLayer;
+       for (int l = 0; l < layerCount; l++) {
+           int traceCount = 0;
+           for (int y = 0; y < boardHeight; y++) {
+               for (int x = 0; x < boardWidth; x++) {
+                   if (grid[l][y][x].type == CELL_TRACE || grid[l][y][x].type == CELL_VIA) {
+                       traceCount++;
+                   }
+               }
+           }
+           tracesPerLayer[l] = traceCount;
+       }
+
+      int totalConnections = results.size() + failed.size();
+       // ПОКАЗЫВАЕМ ОКНО С РЕЗУЛЬТАТАМИ
+      showRoutingResults(successfulTraces, totalConnections, failed.size(), tracesPerLayer);
+
+       multiThreadRoutingInProgress = false;
+       ui->routeBtn->setEnabled(true);
+
+       // Очищаем роутер
+       delete multiThreadRouter;
+       multiThreadRouter = nullptr;
+}
+
+void MainWindow::showRoutingResults(int successCount, int totalCount, int failedCount,
+                                   const QMap<int, int>& tracesPerLayer)
 {
-    Pad* fromPad = getPadById(fromPadId);
-    Pad* toPad = getPadById(toPadId);
+    QString message = QString("<h3>Результаты трассировки</h3>");
+    message += QString("<p><b>Общая статистика:</b></p>");
+    message += QString("<table border='1' cellpadding='5' style='border-collapse: collapse; width: 100%;'>");
+    message += QString("<tr><th>Показатель</th><th>Значение</th></tr>");
+    message += QString("<tr><td>Всего соединений</td><td align='center'><b>%1</b></td></tr>").arg(totalCount);
 
-    if (!fromPad || !toPad) return false;
-
-    QList<GridPoint> pathToPlace = originalPath;
-
-    // Пытаемся разместить путь до 3 раз с оптимизацией
-    for (int attempt = 0; attempt < 3; attempt++) {
-        bool canPlace = true;
-
-        {
-            QMutexLocker locker(&gridMutex);
-
-            // Проверяем, можно ли разместить текущий путь
-            for (int i = 0; i < pathToPlace.size(); i++) {
-                const GridPoint& point = pathToPlace[i];
-
-                // Пропускаем площадки
-                if ((point.x == fromPad->x && point.y == fromPad->y) ||
-                    (point.x == toPad->x && point.y == toPad->y)) {
-                    continue;
-                }
-
-                if (point.x < 0 || point.x >= boardWidth ||
-                    point.y < 0 || point.y >= boardHeight ||
-                    point.layer < 0 || point.layer >= layerCount) {
-                    canPlace = false;
-                    break;
-                }
-
-                GridCell& cell = grid[point.layer][point.y][point.x];
-
-                // Если ячейка занята другой трассой
-                if ((cell.type == CELL_TRACE || cell.type == CELL_VIA) &&
-                    cell.traceId != fromPadId) {
-                    canPlace = false;
-
-                    // Попробуем обойти конфликт
-                    if (attempt < 2) { // Не на последней попытке
-                        // Попробуем найти альтернативный путь в этой точке
-                        pathToPlace = adjustPathAroundConflict(pathToPlace, i, fromPadId, toPadId);
-                        if (pathToPlace.isEmpty()) {
-                            return false;
-                        }
-                        break; // Выйдем из проверки и попробуем заново
-                    }
-                }
-
-                // Проверяем препятствия
-                if (cell.type == CELL_OBSTACLE) {
-                    canPlace = false;
-                    break;
-                }
-            }
-
-            if (canPlace) {
-                // Размещаем трассу
-                for (int i = 0; i < pathToPlace.size(); i++) {
-                    const GridPoint& point = pathToPlace[i];
-
-                    // Пропускаем площадки
-                    if ((point.x == fromPad->x && point.y == fromPad->y) ||
-                        (point.x == toPad->x && point.y == toPad->y)) {
-                        continue;
-                    }
-
-                    GridCell& cell = grid[point.layer][point.y][point.x];
-
-                    // Определяем, является ли это VIA
-                    bool isVia = false;
-                    if (i > 0) {
-                        const GridPoint& prev = pathToPlace[i - 1];
-                        if (prev.x == point.x && prev.y == point.y &&
-                            prev.layer != point.layer) {
-                            isVia = true;
-                        }
-                    }
-
-                    if (isVia) {
-                        cell.type = CELL_VIA;
-                        cell.color = Qt::black;
-                    } else {
-                        cell.type = CELL_TRACE;
-                        cell.color = Qt::white;
-                    }
-                    cell.traceId = fromPadId;
-                }
-
-                // Обновляем соединение
-                conn.routed = true;
-                conn.layer = pathToPlace.first().layer;
-
-                // Скрываем линию связи
-                if (conn.visualLine) {
-                    conn.visualLine->hide();
-                }
-
-                return true;
-            }
-        }
-
-        // Если не удалось разместить, ждем немного и пробуем снова
-        if (attempt < 2) {
-            QThread::msleep(10); // Короткая пауза
-        }
+    if (successCount > 0) {
+        message += QString("<tr><td>Успешно проложено</td><td align='center' style='color: green;'><b>%1</b></td></tr>").arg(successCount);
     }
 
-    return false;
+    if (failedCount > 0) {
+        message += QString("<tr><td>Не удалось проложить</td><td align='center' style='color: red;'><b>%1</b></td></tr>").arg(failedCount);
+    }
+
+    int elapsedMs = routeTimer.elapsed();
+    message += QString("<tr><td>Время выполнения</td><td align='center'><b>%1 мс</b></td></tr>").arg(elapsedMs);
+    message += QString("</table>");
+
+    // Только общая статистика без распределения по слоям
+
+    // Создаем диалоговое окно с увеличенными размерами
+    QDialog resultsDialog(this);
+    resultsDialog.setWindowTitle("Результаты трассировки");
+    resultsDialog.setMinimumSize(500, 400);  // Уменьшенный размер, так как информации меньше
+    resultsDialog.setMaximumSize(600, 450);
+
+    // Устанавливаем стиль для лучшего отображения
+    resultsDialog.setStyleSheet(
+        "QDialog { background-color: white; }"
+        "QTextBrowser { border: 1px solid #ccc; background-color: #f9f9f9; }"
+        "QPushButton { padding: 5px 15px; font-weight: bold; }"
+    );
+
+    QVBoxLayout *layout = new QVBoxLayout(&resultsDialog);
+    layout->setContentsMargins(10, 10, 10, 10);
+    layout->setSpacing(10);
+
+    // Поле для отображения текста
+    QTextBrowser *textBrowser = new QTextBrowser();
+    textBrowser->setHtml(message);
+    textBrowser->setOpenExternalLinks(false);
+    textBrowser->setMinimumHeight(200);  // Уменьшенная высота
+    textBrowser->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+
+    // Панель кнопок
+    QHBoxLayout *buttonLayout = new QHBoxLayout();
+    buttonLayout->setSpacing(10);
+
+    // Если есть неудачные трассы, добавляем кнопку для их просмотра
+    if (failedCount > 0) {
+        QPushButton *showFailedBtn = new QPushButton("Показать неудачные соединения");
+        showFailedBtn->setStyleSheet("QPushButton { background-color: #ffcccc; }");
+        connect(showFailedBtn, &QPushButton::clicked, this, &MainWindow::showFailedConnections);
+        buttonLayout->addWidget(showFailedBtn);
+    }
+
+    buttonLayout->addStretch();
+
+    QPushButton *okButton = new QPushButton("OK");
+    okButton->setDefault(true);
+    okButton->setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }");
+    connect(okButton, &QPushButton::clicked, &resultsDialog, &QDialog::accept);
+
+    buttonLayout->addWidget(okButton);
+
+    layout->addWidget(textBrowser);
+    layout->addLayout(buttonLayout);
+
+    // Показываем окно модально
+    resultsDialog.exec();
 }
 
 int MainWindow::countLayerTransitions(const QList<GridPoint>& path)
@@ -1873,22 +1843,6 @@ QList<GridPoint> MainWindow::adjustPathAroundConflict(const QList<GridPoint>& or
     return originalPath; // Возвращаем оригинальный путь, если не удалось обойти
 }
 
-void MainWindow::drawTraceLineMultiThreaded(const GridPoint& from, const GridPoint& to, int layer)
-{
-    // Обеспечиваем выполнение в основном потоке
-    if (QThread::currentThread() != this->thread()) {
-        QMetaObject::invokeMethod(this, "drawTraceLine",
-                                  Qt::QueuedConnection,
-                                  Q_ARG(GridPoint, from),
-                                  Q_ARG(GridPoint, to),
-                                  Q_ARG(int, layer));
-        return;
-    }
-
-    // Вызываем обычный метод рисования
-    drawTraceLine(from, to, layer);
-}
-
 bool MainWindow::canPlacePathInTempGrid(const QList<GridPoint>& path,
                                        GridCell*** tempGrid,
                                        int fromPadId, int toPadId)
@@ -1996,17 +1950,8 @@ void MainWindow::copyTempGridToMain(GridCell*** tempGrid)
     }
 }
 
-int MainWindow::findLayerForPad(int x, int y)
-{
-    for (int l = 0; l < layerCount; l++) {
-        if (grid[l][y][x].type == CELL_PAD) {
-            return l;
-        }
-    }
-    return 0;
-}
 
-MainWindow::RoutingResult MainWindow::routeSingleConnectionAsync(int connIndex, const Connection& conn)
+RoutingResult MainWindow::routeSingleConnectionAsync(int connIndex, const Connection& conn)
 {
     Pad* fromPad = getPadById(conn.fromPadId);
     Pad* toPad = getPadById(conn.toPadId);
@@ -2059,54 +2004,6 @@ MainWindow::RoutingResult MainWindow::routeSingleConnectionAsync(int connIndex, 
     return result;
 }
 
-void MainWindow::placeTraceSafely(const QList<GridPoint>& path, int fromPadId, int toPadId)
-{
-    QMutexLocker locker(&gridMutex);
-
-    for (int i = 0; i < path.size(); i++) {
-        const GridPoint& point = path[i];
-
-        // Проверяем границы
-        if (point.x < 0 || point.x >= boardWidth ||
-            point.y < 0 || point.y >= boardHeight ||
-            point.layer < 0 || point.layer >= layerCount) {
-            continue;
-        }
-
-        GridCell& cell = grid[point.layer][point.y][point.x];
-
-        // Пропускаем площадки
-        if (cell.type == CELL_PAD) {
-            continue;
-        }
-
-        // Определяем, является ли это VIA (переход между слоями в той же точке)
-        bool isVia = false;
-        if (i > 0) {
-            const GridPoint& prev = path[i - 1];
-            if (prev.x == point.x && prev.y == point.y && prev.layer != point.layer) {
-                isVia = true;
-            }
-        }
-
-        if (isVia) {
-            cell.type = CELL_VIA;
-        } else {
-            cell.type = CELL_TRACE;
-        }
-        cell.traceId = fromPadId;
-    }
-
-    // Обновляем статус соединения
-    for (Connection& conn : connections) {
-        if (conn.fromPadId == fromPadId && conn.toPadId == toPadId) {
-            conn.routed = true;
-            conn.layer = path.first().layer;
-            break;
-        }
-    }
-}
-
 void MainWindow::processRoutingResultsImproved(const QList<RoutingResult>& results,
                                               const QList<Connection>& connectionsToRoute)
 {
@@ -2146,23 +2043,16 @@ void MainWindow::processRoutingResultsImproved(const QList<RoutingResult>& resul
                   return aTransitions < bTransitions;
               });
 
-    for (const RoutingResult& result : sortedResults) {
-        if (!result.success) continue;
+    for (const RoutingResult& result : results) {
+            if (!result.success) continue;
 
-        // Находим соответствующее соединение
-        Connection* conn = nullptr;
-        int connIndex = result.connIndex;
-        if (connIndex >= 0 && connIndex < connectionsToRoute.size()) {
-            const Connection& routeConn = connectionsToRoute[connIndex];
-
-            // Находим это же соединение в основном списке connections
+            Connection* conn = nullptr;
             for (Connection& c : connections) {
-                if (c.fromPadId == routeConn.fromPadId && c.toPadId == routeConn.toPadId) {
+                if (c.fromPadId == result.fromPadId && c.toPadId == result.toPadId) {
                     conn = &c;
                     break;
                 }
             }
-        }
 
         if (!conn || conn->routed) continue;
 
@@ -2330,7 +2220,7 @@ void MainWindow::processRoutingResultsImproved(const QList<RoutingResult>& resul
     qDebug() << "Успешно проложено:" << routedCount << "трасс из" << connectionsToRoute.size();
 }
 
-QList<MainWindow::RoutingResult> MainWindow::routeConnectionsParallel(
+QList<RoutingResult> MainWindow::routeConnectionsParallel(
     const QList<Connection>& connectionsToRoute)
 {
     QList<RoutingResult> results;
@@ -3010,24 +2900,55 @@ void MainWindow::showFailedConnections()
     }
 
     QStringList failedList;
+    QSet<int> uniqueFailed;
+
+    // Собираем уникальные неудачные соединения
     for (int connId : failedConnections) {
         for (const Connection& conn : connections) {
-            // Проверяем по ID первой площадки (traceId)
-            if (conn.fromPadId == connId) {
+            if ((conn.fromPadId == connId || conn.toPadId == connId) &&
+                !conn.routed && !uniqueFailed.contains(conn.fromPadId)) {
                 Pad* pad1 = getPadById(conn.fromPadId);
                 Pad* pad2 = getPadById(conn.toPadId);
                 if (pad1 && pad2) {
-                    failedList << QString("%1 → %2").arg(pad1->name).arg(pad2->name);
+                    failedList << QString("%1 (%2,%3) → %4 (%5,%6)")
+                        .arg(pad1->name).arg(pad1->x).arg(pad1->y)
+                        .arg(pad2->name).arg(pad2->x).arg(pad2->y);
+                    uniqueFailed.insert(conn.fromPadId);
                 }
                 break;
             }
         }
     }
 
-    QString message = QString("Не удалось проложить %1 соединений:\n\n").arg(failedList.size());
-    message += failedList.join("\n");
+    QString message = QString("<h3>Не удалось проложить %1 соединений:</h3>").arg(failedList.size());
+    message += QString("<table border='1' cellpadding='5' style='border-collapse: collapse; width: 100%;'>");
+    message += QString("<tr><th>№</th><th>Соединение</th><th>Координаты</th></tr>");
 
-    QMessageBox::warning(this, "Трассировка не завершена", message);
+    for (int i = 0; i < failedList.size(); ++i) {
+        message += QString("<tr><td align='center'>%1</td><td>%2</td><td align='center'>См. выше</td></tr>")
+                   .arg(i + 1).arg(failedList[i]);
+    }
+    message += QString("</table>");
+
+    // Создаем диалоговое окно с увеличенными размерами
+    QDialog dialog(this);
+    dialog.setWindowTitle("Неудачные соединения");
+    dialog.setMinimumSize(600, 400);
+
+    QVBoxLayout *layout = new QVBoxLayout(&dialog);
+
+    QTextBrowser *textBrowser = new QTextBrowser();
+    textBrowser->setHtml(message);
+    textBrowser->setOpenExternalLinks(false);
+    textBrowser->setMinimumHeight(250);
+
+    QDialogButtonBox *buttonBox = new QDialogButtonBox(QDialogButtonBox::Ok);
+    connect(buttonBox, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+
+    layout->addWidget(textBrowser);
+    layout->addWidget(buttonBox);
+
+    dialog.exec();
 }
 
 void MainWindow::onRemoveObstacle()
@@ -3637,7 +3558,7 @@ void MainWindow::autoFillBoard()
         qDebug() << "Итого создано связей: " << connections.size();
         qDebug() << "Всего площадок: " << pads.size();
         qDebug() << "Среднее количество связей на площадку: "
-                 << (pads.size() > 0 ? (double)connections.size() * 2 / pads.size() : 0);
+                 << (pads.size() > 0 ? static_cast<double>(connections.size()) * 2 / pads.size() : 0);
     } else if (pads.size() == 1) {
         qDebug() << "Только одна площадка, связи не создаются";
     } else {
@@ -3676,4 +3597,107 @@ QList<GridPoint> MainWindow::generateObstacle(int size, int type)
     }
 
     return points;
+}
+
+QList<ConnectionRequest> MainWindow::prepareConnectionRequests()
+{
+    QList<ConnectionRequest> requests;
+
+    for (const Connection& conn : connections) {
+        if (conn.routed) continue;
+
+        Pad* fromPad = getPadById(conn.fromPadId);
+        Pad* toPad = getPadById(conn.toPadId);
+
+        if (!fromPad || !toPad) continue;
+
+        ConnectionRequest request;
+        request.fromPadId = conn.fromPadId;
+        request.toPadId = conn.toPadId;
+
+        // Находим доступные слои для старта
+        int startLayer = findLayerForPad(fromPad->x, fromPad->y);
+        int endLayer = findLayerForPad(toPad->x, toPad->y);
+
+        request.start = GridPoint(fromPad->x, fromPad->y, startLayer);
+        request.end = GridPoint(toPad->x, toPad->y, endLayer);
+        request.priority = abs(fromPad->x - toPad->x) + abs(fromPad->y - toPad->y);
+
+        requests.append(request);
+    }
+
+    // Сортируем по приоритету (короткие пути первыми)
+    std::sort(requests.begin(), requests.end(),
+              [](const ConnectionRequest& a, const ConnectionRequest& b) {
+                  return a.priority < b.priority;
+              });
+
+    return requests;
+}
+
+void MainWindow::applyRoutingResults(const QList<RoutingResult>& results) {
+    QMutexLocker locker(&gridMutex);
+
+    for (const RoutingResult& result : results) {
+        if (!result.success || result.path.isEmpty()) {
+            continue;
+        }
+
+        // Обновляем сетку
+        for (int i = 0; i < result.path.size(); i++) {
+            const GridPoint& point = result.path[i];
+
+            if (point.x < 0 || point.x >= boardWidth ||
+                point.y < 0 || point.y >= boardHeight ||
+                point.layer < 0 || point.layer >= layerCount) {
+                continue;
+            }
+
+            GridCell& cell = grid[point.layer][point.y][point.x];
+
+            // Пропускаем площадки
+            if (cell.type == CELL_PAD) {
+                continue;
+            }
+
+            // Определяем VIA
+            bool isVia = false;
+            if (i > 0) {
+                const GridPoint& prev = result.path[i - 1];
+                if (prev.x == point.x && prev.y == point.y &&
+                    prev.layer != point.layer) {
+                    isVia = true;
+                }
+            }
+
+            if (isVia) {
+                cell.type = CELL_VIA;
+                cell.color = Qt::black;
+            } else {
+                cell.type = CELL_TRACE;
+                cell.color = Qt::white;
+            }
+            cell.traceId = result.fromPadId;
+        }
+
+        // Обновляем соединение
+        for (Connection& conn : connections) {
+            if (conn.fromPadId == result.fromPadId &&
+                conn.toPadId == result.toPadId) {
+                conn.routed = true;
+                conn.layer = result.layerUsed;
+
+                // Скрываем линию связи
+                if (conn.visualLine) {
+                    conn.visualLine->hide();
+                }
+                break;
+            }
+        }
+
+        // Рисуем линии трасс
+        for (int i = 0; i < result.path.size() - 1; i++) {
+            drawTraceLine(result.path[i], result.path[i + 1], result.path[i].layer);
+        }
+    }
 }
