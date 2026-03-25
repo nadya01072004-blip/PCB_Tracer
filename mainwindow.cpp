@@ -1597,8 +1597,6 @@ void MainWindow::onMultiThreadRoutingComplete()
 
     ui->statusBar->showMessage(message);
 
-    QMessageBox::information(this, "Трассировка завершена", message);
-
     multiThreadRoutingInProgress = false;
     ui->routeBtn->setEnabled(true);
 
