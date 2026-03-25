@@ -95,7 +95,7 @@ private slots:
     void onBoardSizeChanged();
     void onAutoFill();
     void onRoutingMethodChanged();
-
+    void retryFailedConnections();
     // Слоты для многопоточной трассировки
     void onMultiThreadRoutingProgress(int percent);
     void onMultiThreadRoutingComplete();
